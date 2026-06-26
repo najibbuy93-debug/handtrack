@@ -1,0 +1,397 @@
+DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>Hand-Tracked Voxel Builder</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#0a0a12; font-family: 'Segoe UI', sans-serif; color:#eee; }
+  #root { position:relative; width:100vw; height:100vh; }
+  #video { display:none; }
+  #cam-preview { position:absolute; top:16px; right:16px; width:220px; height:165px; border:2px solid #444; border-radius:8px; overflow:hidden; background:#000; z-index:5; }
+  #cam-preview canvas { width:100%; height:100%; transform: scaleX(-1); }
+  #ui { position:absolute; top:16px; left:16px; z-index:5; background:rgba(20,20,30,0.75); padding:14px 16px; border-radius:10px; max-width:280px; backdrop-filter: blur(4px); }
+  #ui h1 { font-size:16px; margin:0 0 8px; }
+  #ui p { font-size:12px; line-height:1.5; margin:4px 0; color:#bbb; }
+  .palette { display:flex; gap:6px; margin-top:10px; }
+  .swatch { width:26px; height:26px; border-radius:6px; cursor:pointer; border:2px solid transparent; }
+  .swatch.active { border-color:#fff; }
+  #status { position:absolute; top:197px; right:16px; z-index:5; background:rgba(20,20,30,0.75); padding:10px 14px; border-radius:10px; font-size:12px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  #banner { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); z-index:10; background:rgba(0,0,0,0.85); padding:18px 24px; border-radius:10px; font-size:14px; max-width:340px; text-align:center; border:1px solid #444; }
+  #banner.hidden { display:none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React + Babel (cdnjs) -->
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<!-- Three.js (cdnjs) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- MediaPipe Hands (jsdelivr) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script type="text/babel">
+const { useEffect, useRef, useState } = React;
+
+const GRID_SIZE = 10;
+const CELL = 1;
+const MAX_HEIGHT = 12;
+const COLORS = ["#e53935","#fb8c00","#fdd835","#43a047","#1e88e5","#8e24aa"];
+
+const SMOOTH_ALPHA = 0.35;
+const CONFIRM_FRAMES = 3;
+const HAND_LOST_GRACE = 8;
+const CURSOR_LERP = 0.35;
+const PLACE_THRESHOLD = 0.42;
+const RELEASE_THRESHOLD = 0.55;
+const REMOVE_THRESHOLD = 0.50;
+const REMOVE_RELEASE = 0.65;
+const ACTION_COOLDOWN = 300;
+
+function App() {
+  const mountRef = useRef(null);
+  const videoRef = useRef(null);
+  const previewCanvasRef = useRef(null);
+  const sceneRef = useRef({});
+  const [color, setColor] = useState(COLORS[0]);
+  const colorRef = useRef(color);
+  const [voxelCount, setVoxelCount] = useState(0);
+  const [handVisible, setHandVisible] = useState(false);
+  const [banner, setBanner] = useState("Meminta izin kamera...");
+
+  useEffect(() => { colorRef.current = color; }, [color]);
+
+  useEffect(() => {
+    if (typeof THREE === "undefined") { setBanner("Gagal memuat Three.js. Cek koneksi internet lalu refresh."); return; }
+    if (typeof Hands === "undefined" || typeof Camera === "undefined") {
+      setBanner("Gagal memuat MediaPipe Hands. Cek koneksi internet lalu refresh.");
+      return;
+    }
+
+    const mount = mountRef.current;
+    const width = window.innerWidth, height = window.innerHeight;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a14);
+    scene.fog = new THREE.Fog(0x0a0a14, 15, 40);
+
+    const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 100);
+    let radius = 18, azimuth = Math.PI / 4, elevation = 0.6;
+    function updateCamera() {
+      camera.position.set(
+        radius * Math.cos(elevation) * Math.sin(azimuth),
+        radius * Math.sin(elevation) + 4,
+        radius * Math.cos(elevation) * Math.cos(azimuth)
+      );
+      camera.lookAt(0, 2, 0);
+    }
+    updateCamera();
+
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+    } catch (err) {
+      setBanner("WebGL tidak tersedia di browser ini.");
+      return;
+    }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(width, height);
+    renderer.shadowMap.enabled = true;
+    mount.appendChild(renderer.domElement);
+
+    renderer.domElement.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      setBanner("Konteks grafis terputus. Silakan refresh halaman.");
+    });
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 0.9));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(8, 14, 6);
+    dir.castShadow = true;
+    scene.add(dir);
+
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE),
+      new THREE.MeshStandardMaterial({ color: 0x1c1c28 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    scene.add(new THREE.GridHelper(GRID_SIZE, GRID_SIZE, 0x3a3a4a, 0x2a2a3a));
+
+    const cursor = new THREE.Mesh(
+      new THREE.BoxGeometry(CELL * 0.95, CELL * 0.95, CELL * 0.95),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 })
+    );
+    cursor.visible = false;
+    scene.add(cursor);
+    let cursorTarget = cursor.position.clone();
+
+    const voxelGeo = new THREE.BoxGeometry(CELL * 0.98, CELL * 0.98, CELL * 0.98);
+    const voxels = new Map();
+    const columnHeights = new Map();
+
+    function gridToWorld(gx, gz, gy) {
+      return new THREE.Vector3(
+        (gx - GRID_SIZE / 2 + 0.5) * CELL,
+        gy * CELL + CELL / 2,
+        (gz - GRID_SIZE / 2 + 0.5) * CELL
+      );
+    }
+
+    function placeVoxel(gx, gz, hexColor) {
+      const key2 = gx + "," + gz;
+      const h = columnHeights.get(key2) || 0;
+      if (h >= MAX_HEIGHT) return;
+      const mesh = new THREE.Mesh(voxelGeo, new THREE.MeshStandardMaterial({ color: new THREE.Color(hexColor) }));
+      mesh.position.copy(gridToWorld(gx, gz, h));
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+      voxels.set(key2 + "," + h, mesh);
+      columnHeights.set(key2, h + 1);
+      setVoxelCount(c => c + 1);
+    }
+
+    function removeVoxel(gx, gz) {
+      const key2 = gx + "," + gz;
+      const h = columnHeights.get(key2) || 0;
+      if (h <= 0) return;
+      const topKey = key2 + "," + (h - 1);
+      const mesh = voxels.get(topKey);
+      if (mesh) {
+        scene.remove(mesh);
+        mesh.material.dispose();
+        voxels.delete(topKey);
+      }
+      columnHeights.set(key2, h - 1);
+      setVoxelCount(c => Math.max(0, c - 1));
+    }
+
+    let dragging = false, lastX = 0, lastY = 0;
+    renderer.domElement.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+    window.addEventListener('mouseup', () => dragging = false);
+    window.addEventListener('mousemove', e => {
+      if (!dragging) return;
+      azimuth -= (e.clientX - lastX) * 0.005;
+      elevation = Math.max(0.15, Math.min(1.3, elevation + (e.clientY - lastY) * 0.005));
+      lastX = e.clientX; lastY = e.clientY;
+      updateCamera();
+    });
+    renderer.domElement.addEventListener('wheel', e => {
+      radius = Math.max(6, Math.min(36, radius + e.deltaY * 0.01));
+      updateCamera();
+    });
+
+    let resizeTimer = null;
+    function onResize() {
+      if (resizeTimer) return;
+      resizeTimer = requestAnimationFrame(() => {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.aspect = w / h; camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+        resizeTimer = null;
+      });
+    }
+    window.addEventListener('resize', onResize);
+
+    let rafId;
+    function animate() {
+      rafId = requestAnimationFrame(animate);
+      cursor.rotation.y += 0.02;
+      cursor.position.lerp(cursorTarget, CURSOR_LERP);
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    sceneRef.current = { placeVoxel, removeVoxel, cursor, columnHeights, gridToWorld, setCursorTarget: (v) => { cursorTarget = v; } };
+
+    const video = videoRef.current;
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7
+    });
+
+    let smooth = null;
+    function lerpVal(prev, next) { return prev + (next - prev) * SMOOTH_ALPHA; }
+
+    let placeStreak = 0, placeReleaseStreak = CONFIRM_FRAMES, placeArmed = true;
+    let removeStreak = 0, removeReleaseStreak = CONFIRM_FRAMES, removeArmed = true;
+    let lastActionTime = 0;
+    let noHandFrames = HAND_LOST_GRACE;
+
+    function dist2(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
+
+    hands.onResults((results) => {
+      const canvasEl = previewCanvasRef.current;
+      if (!canvasEl) return;
+      const pctx = canvasEl.getContext('2d');
+      pctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+      if (results.image) pctx.drawImage(results.image, 0, 0, canvasEl.width, canvasEl.height);
+
+      const { placeVoxel, removeVoxel, columnHeights, gridToWorld, setCursorTarget } = sceneRef.current;
+      const hasHand = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+
+      if (hasHand) {
+        noHandFrames = 0;
+        const lm = results.multiHandLandmarks[0];
+
+        pctx.fillStyle = '#00e5ff';
+        lm.forEach(p => {
+          pctx.beginPath();
+          pctx.arc(p.x * canvasEl.width, p.y * canvasEl.height, 3, 0, Math.PI * 2);
+          pctx.fill();
+        });
+
+        const wrist = lm[0], midMcp = lm[9], thumbTip = lm[4], indexTip = lm[8], pinkyTip = lm[20];
+
+        if (!smooth) {
+          smooth = {
+            ix: indexTip.x, iy: indexTip.y,
+            tx: thumbTip.x, ty: thumbTip.y,
+            px: pinkyTip.x, py: pinkyTip.y,
+            wx: wrist.x, wy: wrist.y,
+            mx: midMcp.x, my: midMcp.y
+          };
+        } else {
+          smooth.ix = lerpVal(smooth.ix, indexTip.x); smooth.iy = lerpVal(smooth.iy, indexTip.y);
+          smooth.tx = lerpVal(smooth.tx, thumbTip.x); smooth.ty = lerpVal(smooth.ty, thumbTip.y);
+          smooth.px = lerpVal(smooth.px, pinkyTip.x); smooth.py = lerpVal(smooth.py, pinkyTip.y);
+          smooth.wx = lerpVal(smooth.wx, wrist.x);    smooth.wy = lerpVal(smooth.wy, wrist.y);
+          smooth.mx = lerpVal(smooth.mx, midMcp.x);   smooth.my = lerpVal(smooth.my, midMcp.y);
+        }
+
+        const handScale = dist2(smooth.wx, smooth.wy, smooth.mx, smooth.my) || 0.1;
+
+        const mirroredX = 1 - smooth.ix;
+        const gx = Math.min(GRID_SIZE - 1, Math.max(0, Math.floor(mirroredX * GRID_SIZE)));
+        const gz = Math.min(GRID_SIZE - 1, Math.max(0, Math.floor(smooth.iy * GRID_SIZE)));
+
+        const h = columnHeights.get(gx + "," + gz) || 0;
+        setCursorTarget(gridToWorld(gx, gz, h));
+        sceneRef.current.cursor.visible = true;
+
+        const placeDist = dist2(smooth.tx, smooth.ty, smooth.ix, smooth.iy) / handScale;
+        const removeDist = dist2(smooth.tx, smooth.ty, smooth.px, smooth.py) / handScale;
+        const now = performance.now();
+
+        if (placeDist < PLACE_THRESHOLD) {
+          placeStreak++; placeReleaseStreak = 0;
+        } else if (placeDist > RELEASE_THRESHOLD) {
+          placeReleaseStreak++; placeStreak = 0;
+          if (placeReleaseStreak >= CONFIRM_FRAMES) placeArmed = true;
+        }
+        if (placeArmed && placeStreak >= CONFIRM_FRAMES && now - lastActionTime > ACTION_COOLDOWN) {
+          placeVoxel(gx, gz, colorRef.current);
+          lastActionTime = now;
+          placeArmed = false;
+          placeStreak = 0;
+        }
+
+        if (removeDist < REMOVE_THRESHOLD) {
+          removeStreak++; removeReleaseStreak = 0;
+        } else if (removeDist > REMOVE_RELEASE) {
+          removeReleaseStreak++; removeStreak = 0;
+          if (removeReleaseStreak >= CONFIRM_FRAMES) removeArmed = true;
+        }
+        if (removeArmed && removeStreak >= CONFIRM_FRAMES && now - lastActionTime > ACTION_COOLDOWN) {
+          removeVoxel(gx, gz);
+          lastActionTime = now;
+          removeArmed = false;
+          removeStreak = 0;
+        }
+
+        setHandVisible(true);
+      } else {
+        noHandFrames++;
+        if (noHandFrames >= HAND_LOST_GRACE) {
+          setHandVisible(false);
+          sceneRef.current.cursor.visible = false;
+          smooth = null;
+          placeStreak = 0; placeReleaseStreak = CONFIRM_FRAMES; placeArmed = true;
+          removeStreak = 0; removeReleaseStreak = CONFIRM_FRAMES; removeArmed = true;
+        }
+      }
+    });
+
+    let camUtil;
+    let stopped = false;
+    (async () => {
+      try {
+        camUtil = new Camera(video, {
+          onFrame: async () => {
+            if (stopped) return;
+            try { await hands.send({ image: video }); }
+            catch (err) {}
+          },
+          width: 640,
+          height: 480
+        });
+        await camUtil.start();
+        setBanner(null);
+      } catch (err) {
+        setBanner("Tidak bisa mengakses kamera. Izinkan akses kamera lalu refresh halaman.");
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      window.removeEventListener('resize', onResize);
+      cancelAnimationFrame(rafId);
+      if (camUtil && camUtil.stop) camUtil.stop();
+      if (hands && hands.close) hands.close();
+      voxels.forEach(m => { scene.remove(m); m.material.dispose(); });
+      voxelGeo.dispose();
+      mount.removeChild(renderer.domElement);
+    };
+  }, []);
+
+  return (
+    <div id="root">
+      <div ref={mountRef} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }}></div>
+      <video id="video" ref={videoRef} playsInline></video>
+
+      <div id="cam-preview">
+        <canvas ref={previewCanvasRef} width="220" height="165"></canvas>
+      </div>
+
+      <div id="ui">
+        <h1>🖐️ Hand-Tracked Voxel Builder</h1>
+        <p>Gerakkan jari telunjuk untuk menggeser kursor di atas grid.</p>
+        <p><b>Jempol + Telunjuk rapat</b> → letakkan balok</p>
+        <p><b>Jempol + Kelingking rapat</b> → hapus balok teratas</p>
+        <p>Seret mouse untuk memutar kamera, scroll untuk zoom.</p>
+        <div className="palette">
+          {COLORS.map(c => (
+            <div key={c}
+                 className={"swatch" + (c === color ? " active" : "")}
+                 style={{ background: c }}
+                 onClick={() => setColor(c)} />
+          ))}
+        </div>
+      </div>
+
+      <div id="status">
+        <div><span className="dot" style={{ background: handVisible ? '#43a047' : '#e53935' }}></span>{handVisible ? "Tangan terdeteksi" : "Tangan tidak terlihat"}</div>
+        <div style={{ marginTop: 6 }}>Total balok: <b>{voxelCount}</b></div>
+      </div>
+
+      <div id="banner" className={banner ? "" : "hidden"}>{banner}</div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
